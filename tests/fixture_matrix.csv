@@ -1,0 +1,10 @@
+protocol,loss,reorder,window,seed
+fixture,0,0,1,101
+fixture,0,0,1,202
+fixture,0,0,1,303
+fixture,0.1,0,1,101
+fixture,0.1,0,1,202
+fixture,0.1,0,1,303
+fixture,0,0.3,1,101
+fixture,0,0.3,1,202
+fixture,0,0.3,1,303
