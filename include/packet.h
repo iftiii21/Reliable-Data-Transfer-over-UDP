@@ -1,39 +1,8 @@
-#ifndef PACKET_H
-#define PACKET_H
+#ifndef ARQ_PACKET_FORWARD_H
+#define ARQ_PACKET_FORWARD_H
 
-#include <stdint.h>
-
-#define MAX_PAYLOAD_SIZE 1024
-#define PACKET_MAGIC 0xABCD
-#define PROTOCOL_VERSION 1
-
-// Packet types
-typedef enum {
-    PACKET_DATA = 1,
-    PACKET_ACK = 2,
-    PACKET_START = 3,
-    PACKET_END = 4
-} PacketType;
-
-// Packet header
-typedef struct {
-    uint16_t magic;
-    uint8_t version;
-    uint8_t type;
-
-    uint32_t sequence_number;
-    uint32_t acknowledgement_number;
-
-    uint16_t window_size;
-    uint16_t payload_length;
-
-    uint32_t checksum;
-} PacketHeader;
-
-// Complete packet
-typedef struct {
-    PacketHeader header;
-    uint8_t payload[MAX_PAYLOAD_SIZE];
-} Packet;
+/* Keep the existing public include path while using the transport's one
+ * authoritative packet definition and wire-format API. */
+#include "../src/packet.h"
 
 #endif

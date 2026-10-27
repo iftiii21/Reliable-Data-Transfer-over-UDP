@@ -22,13 +22,8 @@ int stop_wait_make_data(StopWaitState *state, Packet *packet,
 {
     if (state == NULL || packet == NULL || state->active ||
         !valid_length(length, data)) return -1;
-    memset(packet, 0, sizeof(*packet));
-    packet->header.magic = PACKET_MAGIC;
-    packet->header.version = PROTOCOL_VERSION;
-    packet->header.type = PACKET_DATA;
-    packet->header.sequence_number = state->sequence_number;
-    packet->header.payload_length = length;
-    if (length != 0) memcpy(packet->payload, data, length);
+    create_data_packet(packet, state->sequence_number,
+                       (const char *)data, length);
     state->outstanding_packet = *packet;
     state->retry_count = 0;
     state->active = 1;
@@ -87,14 +82,8 @@ int go_back_n_make_data(GoBackNState *state, Packet *packet,
         if (packet == &state->outstanding_packets[i]) return -1;
     }
     offset = outstanding;
-    memset(packet, 0, sizeof(*packet));
-    packet->header.magic = PACKET_MAGIC;
-    packet->header.version = PROTOCOL_VERSION;
-    packet->header.type = PACKET_DATA;
-    packet->header.sequence_number = state->next_sequence;
-    packet->header.window_size = state->window_size;
-    packet->header.payload_length = length;
-    if (length != 0) memcpy(packet->payload, data, length);
+    create_data_packet(packet, state->next_sequence,
+                       (const char *)data, length);
     state->outstanding_packets[offset] = *packet;
     state->next_sequence++;
     return 0;

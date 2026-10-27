@@ -5,9 +5,10 @@
 #include <stdint.h>
 #include "packet.h"
 
-/* State machines use host-order structures. Before passing a received ACK,
- * the caller MUST validate its serialized length, checksum, magic and version.
- * ACK handlers then validate non-NULL arguments and PACKET_ACK type. */
+/* State machines use the packet layer's host-order structures. Before passing
+ * a received ACK, the caller must receive/deserialize it successfully; the
+ * packet layer validates datagram length and checksum. ACK handlers validate
+ * non-NULL arguments and PACKET_ACK type. */
 typedef struct {
     uint32_t sequence_number;
     uint8_t active;

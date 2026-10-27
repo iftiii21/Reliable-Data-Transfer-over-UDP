@@ -8,21 +8,39 @@
 
 int main(void)
 {
-    const char *input_filename = "/tmp/file_test_input.bin";
-    const char *output_filename = "/tmp/file_test_output.bin";
+    const char *input_filename = "file_transfer_test_input.tmp";
+    const char *output_filename = "file_transfer_test_output.tmp";
+    FILE *input = NULL;
+    FILE *original = NULL;
+    FILE *reconstructed = NULL;
+    FileSender sender = {0};
+    FileReceiver receiver = {0};
+    int input_created = 0;
+    int output_created = 0;
+    int result = 1;
 
     /*
      * ------------------------------------------------------------
      * Step 1: Create a known 3000-byte test file.
      * ------------------------------------------------------------
      */
-    FILE *input = fopen(input_filename, "wb");
+    input = fopen(input_filename, "rb");
+    if (input != NULL)
+    {
+        fclose(input);
+        input = NULL;
+        fprintf(stderr, "Temporary test input already exists: %s\n",
+                input_filename);
+        goto cleanup;
+    }
+    input = fopen(input_filename, "wb");
 
     if (input == NULL)
     {
         perror("fopen input");
-        return 1;
+        goto cleanup;
     }
+    input_created = 1;
 
     for (int i = 0; i < TEST_SIZE; i++)
     {
@@ -31,24 +49,22 @@ int main(void)
         if (fwrite(&value, 1, 1, input) != 1)
         {
             perror("fwrite input");
-            fclose(input);
-            return 1;
+            goto cleanup;
         }
     }
 
     fclose(input);
+    input = NULL;
 
     /*
      * ------------------------------------------------------------
      * Step 2: Read the file through our file segmentation API.
      * ------------------------------------------------------------
      */
-    FileSender sender;
-
     if (file_sender_open(&sender, input_filename) != 0)
     {
         printf("Failed to open sender file\n");
-        return 1;
+        goto cleanup;
     }
 
     Packet packets[MAX_TEST_PACKETS];
@@ -64,8 +80,7 @@ int main(void)
         if (result == -1)
         {
             printf("Error while reading file\n");
-            file_sender_close(&sender);
-            return 1;
+            goto cleanup;
         }
 
         if (result == 0)
@@ -95,7 +110,7 @@ int main(void)
     if (packet_count != 3)
     {
         printf("Unexpected packet count\n");
-        return 1;
+        goto cleanup;
     }
 
     /*
@@ -111,33 +126,39 @@ int main(void)
      * The receiver should still reconstruct the correct file.
      * ------------------------------------------------------------
      */
-    FileReceiver receiver;
+    input = fopen(output_filename, "rb");
+    if (input != NULL)
+    {
+        fclose(input);
+        input = NULL;
+        fprintf(stderr, "Temporary test output already exists: %s\n",
+                output_filename);
+        goto cleanup;
+    }
 
     if (file_receiver_open(&receiver, output_filename) != 0)
     {
         printf("Failed to open receiver file\n");
-        return 1;
+        goto cleanup;
     }
+    output_created = 1;
 
     if (file_receiver_write_packet(&receiver, &packets[2]) != 0)
     {
         printf("Failed to write packet 2\n");
-        file_receiver_close(&receiver);
-        return 1;
+        goto cleanup;
     }
 
     if (file_receiver_write_packet(&receiver, &packets[0]) != 0)
     {
         printf("Failed to write packet 0\n");
-        file_receiver_close(&receiver);
-        return 1;
+        goto cleanup;
     }
 
     if (file_receiver_write_packet(&receiver, &packets[1]) != 0)
     {
         printf("Failed to write packet 1\n");
-        file_receiver_close(&receiver);
-        return 1;
+        goto cleanup;
     }
 
     file_receiver_close(&receiver);
@@ -149,8 +170,8 @@ int main(void)
      * Step 4: Compare original and reconstructed files.
      * ------------------------------------------------------------
      */
-    FILE *original = fopen(input_filename, "rb");
-    FILE *reconstructed = fopen(output_filename, "rb");
+    original = fopen(input_filename, "rb");
+    reconstructed = fopen(output_filename, "rb");
 
     if (original == NULL || reconstructed == NULL)
     {
@@ -166,7 +187,7 @@ int main(void)
             fclose(reconstructed);
         }
 
-        return 1;
+        goto cleanup;
     }
 
     int different = 0;
@@ -193,15 +214,27 @@ int main(void)
     }
 
     fclose(original);
+    original = NULL;
     fclose(reconstructed);
+    reconstructed = NULL;
 
     if (different)
     {
         printf("FILE TEST FAILED\n");
-        return 1;
+        goto cleanup;
     }
 
     printf("FILE TEST PASSED\n");
 
-    return 0;
+    result = 0;
+
+cleanup:
+    if (input != NULL) fclose(input);
+    if (original != NULL) fclose(original);
+    if (reconstructed != NULL) fclose(reconstructed);
+    file_sender_close(&sender);
+    file_receiver_close(&receiver);
+    if (input_created) remove(input_filename);
+    if (output_created) remove(output_filename);
+    return result;
 }
