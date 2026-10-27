@@ -1,0 +1,294 @@
+#include "net_portable.h"
+#include "channel.h"
+#include <inttypes.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <math.h>
+
+typedef struct {
+    uint64_t due, order, packet_id;
+    size_t length;
+    unsigned direction, copy;
+    uint8_t bytes[];
+} Pending;
+
+typedef struct {
+    Pending **heap;
+    size_t used, capacity;
+    uint64_t serial, received[2], forwarded[2], dropped[2], overflow[2];
+    uint64_t origin;
+    FILE *log;
+} Queue;
+
+static volatile sig_atomic_t running = 1;
+static void stop_running(int signum) { (void)signum; running = 0; }
+
+static void usage(const char *program)
+{
+    fprintf(stderr,
+        "Usage: %s --listen-port PORT --receiver-port PORT [options]\n"
+        "  --receiver-ip IPv4 (default 127.0.0.1) --seed UINT64 (default 1)\n"
+        "  --loss P --duplicate P --reorder P --corrupt P  (0..1)\n"
+        "  --delay-ms N --jitter-ms N --reorder-ms N (default 25)\n"
+        "  --direction both|data|ack (default both) --log PATH\n"
+        "  --stop-file PATH (drain and exit when this marker exists)\n"
+        "  --queue-limit N (default 4096, max 65536)\n"
+        "  --idle-ms N (default 30000) --run-ms N (default 0: unlimited)\n"
+        "Binds loopback; one sender session per process. Logs include ACKs.\n",
+        program);
+}
+
+static int uint_value(const char *text, uint64_t maximum, uint64_t *result)
+{
+    char *end;
+    unsigned long long value;
+    if (!text[0] || text[0] == '-' || text[0] == '+') return -1;
+    for (const char *digit = text; *digit; digit++)
+        if (*digit < '0' || *digit > '9') return -1;
+    errno = 0;
+    value = strtoull(text, &end, 10);
+    if (errno || *end || value > maximum) return -1;
+    *result = (uint64_t)value;
+    return 0;
+}
+
+static int probability(const char *text, uint32_t *result)
+{
+    char *end;
+    double value;
+    errno = 0;
+    value = strtod(text, &end);
+    if (!text[0] || *end || errno || !isfinite(value) || value < 0 || value > 1)
+        return -1;
+    *result = (uint32_t)(value * CHANNEL_SCALE + 0.5);
+    return 0;
+}
+
+static int before(const Pending *a, const Pending *b)
+{
+    return a->due < b->due || (a->due == b->due && a->order < b->order);
+}
+
+static void push(Queue *queue, Pending *packet)
+{
+    size_t index = queue->used++;
+    while (index && before(packet, queue->heap[(index - 1) / 2])) {
+        queue->heap[index] = queue->heap[(index - 1) / 2];
+        index = (index - 1) / 2;
+    }
+    queue->heap[index] = packet;
+}
+
+static Pending *pop(Queue *queue)
+{
+    Pending *first = queue->heap[0], *last = queue->heap[--queue->used];
+    size_t index = 0;
+    while (index * 2 + 1 < queue->used) {
+        size_t child = index * 2 + 1;
+        if (child + 1 < queue->used && before(queue->heap[child + 1], queue->heap[child])) child++;
+        if (!before(queue->heap[child], last)) break;
+        queue->heap[index] = queue->heap[child];
+        index = child;
+    }
+    if (queue->used) queue->heap[index] = last;
+    return first;
+}
+
+static void event(Queue *queue, uint64_t now, unsigned direction, uint64_t id,
+                  const char *action, unsigned copy, size_t length, uint64_t due,
+                  const ChannelDecision *decision)
+{
+    if (!queue->log) return;
+    fprintf(queue->log, "%" PRIu64 ",%s,%" PRIu64 ",%s,%u,%zu,%" PRIu64 ",%d,%d,%zu,%u\n",
+        now - queue->origin, direction ? "ack" : "data", id, action, copy, length,
+        due - queue->origin, decision ? decision->reordered : 0,
+        decision ? decision->corrupted : 0,
+        decision ? decision->corrupt_byte : 0,
+        decision ? (unsigned)decision->corrupt_mask : 0);
+}
+
+static int enqueue(Queue *queue, ChannelState *state, const ChannelConfig *config,
+                    unsigned direction, uint8_t *bytes, size_t length, uint64_t now)
+{
+    ChannelDecision decision;
+    uint64_t id = ++queue->received[direction];
+    if (channel_decide(state, config, length, &decision)) return -1;
+    if (!decision.copies) {
+        queue->dropped[direction]++;
+        event(queue, now, direction, id, "loss", 0, length, now, &decision);
+    }
+    if (decision.corrupted) bytes[decision.corrupt_byte] ^= decision.corrupt_mask;
+    for (unsigned copy = 0; copy < decision.copies; ++copy) {
+        uint64_t due = now + decision.delay_us;
+        Pending *packet;
+        if (queue->used == queue->capacity) {
+            queue->overflow[direction]++;
+            event(queue, now, direction, id, "overflow", copy, length, due, &decision);
+            continue;
+        }
+        packet = malloc(sizeof(*packet) + length);
+        if (!packet) return -1;
+        packet->due = due;
+        packet->order = queue->serial++;
+        packet->packet_id = id;
+        packet->direction = direction;
+        packet->copy = copy;
+        packet->length = length;
+        memcpy(packet->bytes, bytes, length);
+        push(queue, packet);
+        event(queue, now, direction, id, "enqueue", copy, length, due, &decision);
+    }
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    ChannelConfig config = {0, 0, 0, 0, 0, 0, 25}, clean = {0};
+    ChannelState states[2];
+    Queue queue = {0};
+    struct sockaddr_in receiver = {0}, sender = {0};
+    const char *ip = "127.0.0.1", *log_path = NULL, *stop_path = NULL;
+    uint64_t seed = 1, listen_port = 0, receiver_port = 0, capacity = 4096;
+    uint64_t idle_ms = 30000, run_ms = 0, last_activity;
+    int direction_mode = 2, sender_known = 0, stop_requested = 0, result = 1;
+    net_socket front = NET_INVALID, back = NET_INVALID;
+    uint8_t bytes[CHANNEL_MAX_DATAGRAM + 1];
+    for (int i = 1; i < argc; i++) {
+        const char *key = argv[i], *value;
+        uint64_t number;
+        if (!strcmp(key, "--help")) { usage(argv[0]); return 0; }
+        if (++i == argc) { usage(argv[0]); return 2; }
+        value = argv[i];
+        if (!strcmp(key, "--receiver-ip")) ip = value;
+        else if (!strcmp(key, "--log")) log_path = value;
+        else if (!strcmp(key, "--stop-file")) stop_path = value;
+        else if (!strcmp(key, "--direction")) {
+            if (!strcmp(value, "both")) direction_mode = 2;
+            else if (!strcmp(value, "data")) direction_mode = 0;
+            else if (!strcmp(value, "ack")) direction_mode = 1;
+            else goto invalid;
+        } else if (!strcmp(key, "--loss")) { if (probability(value, &config.loss)) goto invalid; }
+        else if (!strcmp(key, "--duplicate")) { if (probability(value, &config.duplicate)) goto invalid; }
+        else if (!strcmp(key, "--reorder")) { if (probability(value, &config.reorder)) goto invalid; }
+        else if (!strcmp(key, "--corrupt")) { if (probability(value, &config.corrupt)) goto invalid; }
+        else {
+            if (uint_value(value, UINT64_MAX, &number)) goto invalid;
+            if (!strcmp(key, "--seed")) seed = number;
+            else if (!strcmp(key, "--listen-port") && number > 0 && number <= 65535) listen_port = number;
+            else if (!strcmp(key, "--receiver-port") && number > 0 && number <= 65535) receiver_port = number;
+            else if (!strcmp(key, "--queue-limit") && number > 0 && number <= 65536) capacity = number;
+            else if (!strcmp(key, "--idle-ms") && number > 0 && number <= CHANNEL_MAX_DELAY_MS) idle_ms = number;
+            else if (!strcmp(key, "--run-ms") && number <= CHANNEL_MAX_DELAY_MS) run_ms = number;
+            else if (number <= CHANNEL_MAX_DELAY_MS && !strcmp(key, "--delay-ms")) config.delay_ms = (uint32_t)number;
+            else if (number <= CHANNEL_MAX_DELAY_MS && !strcmp(key, "--jitter-ms")) config.jitter_ms = (uint32_t)number;
+            else if (number <= CHANNEL_MAX_DELAY_MS && !strcmp(key, "--reorder-ms")) config.reorder_ms = (uint32_t)number;
+            else goto invalid;
+        }
+        continue;
+invalid:
+        fprintf(stderr, "Invalid option/value: %s %s\n", key, value);
+        return 2;
+    }
+    if (!listen_port || !receiver_port || listen_port == receiver_port) { usage(argv[0]); return 2; }
+    receiver.sin_family = AF_INET;
+    receiver.sin_port = htons((uint16_t)receiver_port);
+    if (inet_pton(AF_INET, ip, &receiver.sin_addr) != 1) { fprintf(stderr, "Invalid receiver IPv4\n"); return 2; }
+    if (net_start()) { fprintf(stderr, "Socket initialization failed\n"); return 1; }
+    queue.capacity = (size_t)capacity;
+    queue.heap = calloc(queue.capacity, sizeof(*queue.heap));
+    if (!queue.heap) goto cleanup;
+    if (log_path) {
+        queue.log = fopen(log_path, "w");
+        if (!queue.log) { perror("event log"); goto cleanup; }
+        fprintf(queue.log, "time_us,direction,packet_id,event,copy,length,due_us,reordered,corrupted,corrupt_byte,corrupt_mask\n");
+    }
+    front = net_bind((unsigned)listen_port);
+    back = net_bind(0);
+    if (front == NET_INVALID || back == NET_INVALID) { fprintf(stderr, "UDP bind failed\n"); goto cleanup; }
+    channel_init(&states[0], seed);
+    channel_init(&states[1], seed ^ UINT64_C(0xd1b54a32d192ed03));
+    signal(SIGINT, stop_running);
+    signal(SIGTERM, stop_running);
+    queue.origin = last_activity = net_now_us();
+    fprintf(stderr, "READY listen=127.0.0.1:%" PRIu64 " receiver=%s:%" PRIu64 " seed=%" PRIu64 "\n",
+            listen_port, ip, receiver_port, seed);
+    fflush(stderr);
+    result = 0;
+    while (running) {
+        uint64_t now = net_now_us(), wait_us = 20000;
+        fd_set reads;
+        struct timeval timeout;
+        int ready;
+        if (stop_path && !stop_requested) {
+            FILE *marker = fopen(stop_path, "rb");
+            if (marker) { fclose(marker); stop_requested = 1; }
+        }
+        while (queue.used && queue.heap[0]->due <= now) {
+            Pending *packet = pop(&queue);
+            const struct sockaddr_in *destination = packet->direction ? &sender : &receiver;
+            net_socket socket_fd = packet->direction ? front : back;
+            int sent = sendto(socket_fd, (const char *)packet->bytes, (int)packet->length, 0,
+                              (const struct sockaddr *)destination, sizeof(*destination));
+            event(&queue, net_now_us(), packet->direction, packet->packet_id,
+                  sent == (int)packet->length ? "forward" : "send_error",
+                  packet->copy, packet->length, packet->due, NULL);
+            if (sent != (int)packet->length) { result = 1; free(packet); goto cleanup; }
+            queue.forwarded[packet->direction]++;
+            free(packet);
+            now = net_now_us();
+        }
+        if (run_ms && now - queue.origin >= run_ms * 1000) break;
+        if (stop_requested && !queue.used) break;
+        if (!queue.used && now - last_activity >= idle_ms * 1000) break;
+        if (queue.used && queue.heap[0]->due - now < wait_us) wait_us = queue.heap[0]->due - now;
+        timeout.tv_sec = 0;
+        timeout.tv_usec = (long)wait_us;
+        FD_ZERO(&reads);
+        FD_SET(front, &reads);
+        FD_SET(back, &reads);
+        ready = select((int)(front > back ? front : back) + 1, &reads, NULL, NULL, &timeout);
+        if (ready < 0) { if (net_interrupted()) continue; result = 1; break; }
+        for (unsigned direction = 0; direction < 2; direction++) {
+            struct sockaddr_in from;
+            net_socklen from_length = sizeof(from);
+            net_socket socket_fd = direction ? back : front;
+            int length;
+            if (!FD_ISSET(socket_fd, &reads)) continue;
+            length = recvfrom(socket_fd, (char *)bytes, sizeof(bytes), 0,
+                              (struct sockaddr *)&from, &from_length);
+            if (length < 0) { if (net_interrupted()) continue; result = 1; goto cleanup; }
+            if (direction && (!sender_known || !net_same_peer(&from, &receiver))) continue;
+            if (!direction && sender_known && !net_same_peer(&from, &sender)) continue;
+            if ((unsigned)length > CHANNEL_MAX_DATAGRAM) continue;
+            if (!direction && !sender_known) { sender = from; sender_known = 1; }
+            last_activity = net_now_us();
+            if (enqueue(&queue, &states[direction],
+                direction_mode == 2 || direction_mode == (int)direction ? &config : &clean,
+                direction, bytes, (size_t)length, last_activity)) { result = 1; goto cleanup; }
+        }
+    }
+cleanup:
+    if (front != NET_INVALID) net_close(front);
+    if (back != NET_INVALID) net_close(back);
+    while (queue.used) {
+        Pending *packet = pop(&queue);
+        event(&queue, net_now_us(), packet->direction, packet->packet_id,
+              "shutdown_drop", packet->copy, packet->length, packet->due, NULL);
+        free(packet);
+    }
+    if (queue.log) {
+        if (ferror(queue.log)) result = 1;
+        if (fclose(queue.log)) result = 1;
+    }
+    fprintf(stderr, "SUMMARY data_received=%" PRIu64 " ack_received=%" PRIu64
+        " data_forwarded=%" PRIu64 " ack_forwarded=%" PRIu64
+        " data_loss=%" PRIu64 " ack_loss=%" PRIu64
+        " data_overflow=%" PRIu64 " ack_overflow=%" PRIu64 "\n",
+        queue.received[0], queue.received[1], queue.forwarded[0], queue.forwarded[1],
+        queue.dropped[0], queue.dropped[1], queue.overflow[0], queue.overflow[1]);
+    free(queue.heap);
+    net_stop();
+    return result;
+}

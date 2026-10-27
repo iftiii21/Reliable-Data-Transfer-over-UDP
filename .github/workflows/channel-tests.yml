@@ -1,0 +1,24 @@
+name: Channel emulator tests
+on:
+  push:
+  pull_request:
+
+jobs:
+  channel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and exercise deterministic and real UDP tests
+        run: make integration
+      - name: Check C memory and undefined behavior
+        run: |
+          make clean
+          make integration CFLAGS="-std=c11 -g -O1 -Wall -Wextra -Wpedantic -Werror -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer"
+      - name: Exercise experiment runner success and failure paths
+        run: bash tests/test_runner.sh
+      - name: Install analysis dependencies
+        run: python -m pip install -r analysis/requirements.txt
+      - name: Validate analysis and shell scripts
+        run: |
+          python -m unittest discover -s tests -p 'test_analysis.py'
+          bash -n tests/integration.sh tests/test_runner.sh experiments/run_matrix.sh experiments/adapters/*.sh tests/adapters/*.sh
